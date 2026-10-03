@@ -1,0 +1,45 @@
+id = "lg-webos"
+name = "LG webOS TV (2020-2021 models)"
+notes = """
+Starter profile, not yet verified against Plex decisions. 2020-2021 LG models
+dropped DTS; 2022+ models restored it (copy this file and add `[audio.dts]`).
+"""
+
+containers = ["mkv", "mp4", "mov", "ts"]
+
+# Text subtitles the app renders itself. Image subs (PGS/VobSub) and styled
+# ASS get burned in by Plex when "Burn subtitles" is set to Automatic.
+subtitles = ["srt", "webvtt", "mov_text"]
+
+hdr = ["hdr10", "hlg", "dolby_vision"]
+dovi_profiles = [5, 8]
+
+[video.h264]
+max_bit_depth = 8
+max_level = 51
+
+[video.hevc]
+max_bit_depth = 10
+
+[video.av1]
+max_bit_depth = 10
+
+[video.vp9]
+max_bit_depth = 10
+
+[video.mpeg2video]
+
+[audio.aac]
+max_channels = 6
+
+[audio.ac3]
+max_channels = 6
+
+[audio.eac3]
+max_channels = 8
+
+[audio.mp3]
+max_channels = 2
+
+[audio.flac]
+max_channels = 6
