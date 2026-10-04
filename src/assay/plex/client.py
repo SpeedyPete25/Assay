@@ -80,6 +80,10 @@ class PlexClient:
             if not items or start >= total:
                 return
 
+    def sessions(self) -> list[dict]:
+        """Active playback sessions with Player and TranscodeSession details."""
+        return self._get("/status/sessions").get("Metadata", [])
+
     def metadata(self, rating_key: str) -> dict:
         """Full metadata for one item, including Media/Part/Stream."""
         items = self._get(f"/library/metadata/{rating_key}").get("Metadata", [])

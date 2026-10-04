@@ -5,6 +5,9 @@ Starter profile, not yet verified against Plex decisions. 2020-2021 LG models
 dropped DTS; 2022+ models restored it (copy this file and add `[audio.dts]`).
 """
 
+# Plex players this profile applies to (Player.platform / Player.product).
+match_platforms = ["webOS"]
+
 containers = ["mkv", "mp4", "mov", "ts"]
 
 # Text subtitles the app renders itself. Image subs (PGS/VobSub) and styled

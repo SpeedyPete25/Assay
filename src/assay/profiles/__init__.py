@@ -37,6 +37,9 @@ class Profile:
     hdr: frozenset[str] = frozenset()  # "hdr10", "hlg", "dolby_vision"
     dovi_profiles: frozenset[int] = frozenset()
     max_bitrate_kbps: int | None = None
+    # Used by `assay plex watch` to pick a profile for a Plex player.
+    match_platforms: frozenset[str] = frozenset()
+    match_products: frozenset[str] = frozenset()
 
     def with_max_bitrate(self, kbps: int | None) -> Profile:
         return replace(self, max_bitrate_kbps=kbps) if kbps else self
@@ -58,6 +61,8 @@ def parse_profile(data: dict) -> Profile:
         hdr=frozenset(data.get("hdr", [])),
         dovi_profiles=frozenset(data.get("dovi_profiles", [])),
         max_bitrate_kbps=data.get("max_bitrate_kbps"),
+        match_platforms=frozenset(data.get("match_platforms", [])),
+        match_products=frozenset(data.get("match_products", [])),
     )
 
 
