@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import random
 import time
 from collections import Counter, defaultdict
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import Annotated
 
@@ -15,9 +17,11 @@ from rich.table import Table
 from assay.diagnose import Diagnosis, diagnose
 from assay.models import Impact
 from assay.plex import PlexClient, PlexError
-from assay.profiles import bundled_profiles, load_profile
+from assay.plex.decision import ClientIdentity
+from assay.profiles import Profile, bundled_profiles, load_profile
 from assay.scan import scan_library, scannable_sections
 from assay.store import Store
+from assay.verify import Check, check_version, verify
 from assay.watch import Player, Result, match_profile, poll_once
 
 app = typer.Typer(help="Assay: Plex library health and 'why is this transcoding?' diagnostics.", no_args_is_help=True)
@@ -331,6 +335,181 @@ def history(
     for profile_id, counts in sorted(by_profile.items()):
         total = counts[True] + counts[False]
         console.print(f"[bold]{profile_id}[/]: {counts[True]}/{total} predictions correct")
+
+
+class SubtitleMode(str, Enum):
+    auto = "auto"
+    none = "none"
+
+
+SubtitlesOption = Annotated[
+    SubtitleMode,
+    typer.Option("--subtitles", help="'auto' uses your account's subtitle choice per title; 'none' turns them off."),
+]
+AsPlayerOption = Annotated[
+    str | None,
+    typer.Option("--as-player", help="Ask as a player seen by 'assay plex watch' (uses its real product/platform)."),
+]
+OptionalClientOption = Annotated[
+    str | None, typer.Option("--client", "-c", help="Client profile id or .toml path (optional with --as-player).")
+]
+
+
+def _target(store: Store, client: str | None, as_player: str | None, max_bitrate: int | None) -> tuple[Profile, ClientIdentity]:
+    """Work out which profile to predict with and which identity to ask Plex as."""
+    identity = None
+    if as_player:
+        player = next((p for p in store.seen_players() if p[0].lower() == as_player.lower()), None)
+        if player is None:
+            _fail(f"No player named '{as_player}' has been seen. Run 'assay plex watch' while it plays, or see 'assay clients'.")
+        title, product, platform, _ = player
+        identity = ClientIdentity(product=product, platform=platform)
+        if client is None:
+            client = match_profile(Player(title, product, platform, ""), store.client_mappings(), bundled_profiles())
+            if client is None:
+                _fail(f"'{as_player}' has no profile. Pass -c, or map one with 'assay clients map'.")
+    if client is None:
+        _fail("Pass --client/-c, or --as-player.")
+
+    profile = _profile(client, max_bitrate)
+    identity = identity or profile.plex_identity
+    if identity is None:
+        _fail(f"Profile '{profile.id}' has no [plex_identity] section. Add one, or use --as-player.")
+    return profile, identity
+
+
+def _find_items(store: Store, query: str, limit: int = 5):
+    item = store.get(query)
+    items = [item] if item else store.search(query)
+    if not items:
+        _fail(f"Nothing in the cache matches '{query}'. Run 'assay plex scan' first.")
+    if len(items) > limit:
+        console.print(f"[yellow]{len(items)} matches; showing the first {limit}. Narrow the search or use a ratingKey.[/]\n")
+    return items[:limit]
+
+
+def _print_check(c: Check, identity: ClientIdentity) -> None:
+    header = f"[bold]{escape(c.item.title)}[/]"
+    if len(c.item.versions) > 1:
+        header += f"  [dim](version {c.version.id})[/]"
+    console.print(header)
+    console.print(f"  [dim]Asked Plex as {escape(identity.product)} ({escape(identity.platform)})[/]")
+    if c.error:
+        console.print(f"  [red]{escape(c.error)}[/]\n")
+        return
+    d = c.decision
+    streams = ", ".join(
+        f"{kind} {value}"
+        for kind, value in (("video", d.video_decision), ("audio", d.audio_decision), ("subs", d.subtitle_decision))
+        if value
+    )
+    console.print(f"  Plex:  {_impact(d.impact)}" + (f" [dim]({streams})[/]" if streams else ""))
+    if d.reason:
+        console.print(f'         [dim]"{escape(d.reason)}"[/]')
+    console.print(f"  Assay: {_impact(c.diagnosis.impact)} [dim]({c.diagnosis.profile.id})[/]   {_verdict_mark(c.matched)}")
+    for hint in c.hints:
+        console.print(f"  [yellow]-[/] {escape(hint)}")
+    console.print()
+
+
+@plex_app.command("ask")
+def plex_ask(
+    query: Annotated[str, typer.Argument(help="Title to search for, or a Plex ratingKey.")],
+    url: UrlOption,
+    token: TokenOption,
+    client: OptionalClientOption = None,
+    as_player: AsPlayerOption = None,
+    db: DbOption = Path("assay.db"),
+    subtitles: SubtitlesOption = SubtitleMode.auto,
+    max_bitrate: BitrateOption = None,
+    raw: Annotated[bool, typer.Option("--raw", help="Print Plex's raw decision JSON.")] = False,
+) -> None:
+    """Ask Plex how it would play a title on a client, and compare with Assay."""
+    with PlexClient(url, token) as plex, Store(db) as store:
+        profile, identity = _target(store, client, as_player, max_bitrate)
+        for item in _find_items(store, query):
+            for i in range(len(item.versions)):
+                c = check_version(plex, item, i, profile, identity, subtitles=subtitles.value)
+                if raw and c.decision:
+                    console.print_json(data=c.decision.raw)
+                else:
+                    _print_check(c, identity)
+
+
+@plex_app.command("verify")
+def plex_verify(
+    url: UrlOption,
+    token: TokenOption,
+    client: OptionalClientOption = None,
+    as_player: AsPlayerOption = None,
+    db: DbOption = Path("assay.db"),
+    library: Annotated[str | None, typer.Option("--library", "-l")] = None,
+    sample: Annotated[int | None, typer.Option(help="Check a random sample of this many titles.")] = None,
+    subtitles: SubtitlesOption = SubtitleMode.auto,
+    max_bitrate: BitrateOption = None,
+    workers: Annotated[int, typer.Option(help="Concurrent decision requests.")] = 4,
+) -> None:
+    """Check a profile against Plex's own decisions across the library, without playing anything."""
+    with PlexClient(url, token) as plex, Store(db) as store:
+        profile, identity = _target(store, client, as_player, max_bitrate)
+        items = [i for i in store.items(library) if i.versions]
+        if not items:
+            _fail("The cache is empty. Run 'assay plex scan' first.")
+        if sample and sample < len(items):
+            items = random.sample(items, sample)
+
+        # One request up front, so a rejected request fails fast instead of once per title.
+        first = check_version(plex, items[0], 0, profile, identity, subtitles=subtitles.value)
+        if first.error:
+            _fail(f"Plex rejected the decision request: {first.error}\nTry: assay plex ask {items[0].rating_key} -c {profile.id} --raw")
+
+        with Progress(console=console, transient=True) as progress:
+            task = progress.add_task(f"Asking Plex as {identity.product}", total=None)
+            checks = verify(
+                plex,
+                items,
+                profile,
+                identity,
+                subtitles=subtitles.value,
+                workers=workers,
+                on_progress=lambda done, total: progress.update(task, completed=done, total=total),
+            )
+
+    compared = [c for c in checks if c.matched is not None]
+    errors = [c for c in checks if c.error]
+    agree = sum(c.matched for c in compared)
+    console.print(
+        f"[bold]{len(compared)} files[/] checked as {escape(identity.product)} ({escape(identity.platform)}) "
+        f"against profile [bold]{profile.id}[/]: {agree}/{len(compared)} predictions match "
+        f"({100 * agree / max(len(compared), 1):.0f}%)\n"
+    )
+
+    matrix = Table("Plex \\ Assay", *(i.label for i in Impact), title="Plex's decision vs Assay's prediction")
+    counts = Counter((c.decision.impact, c.diagnosis.impact) for c in compared)
+    for actual in Impact:
+        matrix.add_row(_impact(actual), *(str(counts[actual, predicted]) for predicted in Impact))
+    console.print(matrix)
+
+    by_hint: dict[str, list[Check]] = defaultdict(list)
+    for c in compared:
+        for hint in c.hints:
+            by_hint[hint].append(c)
+    if by_hint:
+        fixes = Table("Files", "Suggestion", "Example", title="Suggested profile fixes")
+        for hint, hits in sorted(by_hint.items(), key=lambda kv: -len(kv[1])):
+            fixes.add_row(str(len(hits)), escape(hint), escape(hits[0].item.title))
+        console.print(fixes)
+
+    mismatches = [c for c in compared if not c.matched]
+    if mismatches:
+        table = Table("Title", "Plex", "Assay", "Plex's reason", title=f"Mismatches (first 15 of {len(mismatches)})")
+        for c in mismatches[:15]:
+            table.add_row(escape(c.item.title), _impact(c.decision.impact), _impact(c.diagnosis.impact), escape(c.decision.reason))
+        console.print(table)
+
+    if errors:
+        console.print(f"[yellow]{len(errors)} requests failed, e.g. {escape(errors[0].item.title)}: {escape(errors[0].error)}[/]")
+    console.print("[dim]Plex answers from its server-side profile for this identity; the real app may support more.[/]")
 
 
 if __name__ == "__main__":

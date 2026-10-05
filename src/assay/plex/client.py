@@ -7,6 +7,7 @@ from collections.abc import Iterator
 import httpx
 
 from assay import __version__
+from assay.plex.decision import ClientIdentity, PlexDecision, decision_params, parse_decision
 
 # Plex library "type" numbers used by /library/sections/{id}/all?type=N
 TYPE_MOVIE = 1
@@ -49,15 +50,16 @@ class PlexClient:
     def __exit__(self, *exc) -> None:
         self.close()
 
-    def _get(self, path: str, **params) -> dict:
+    def _get(self, endpoint: str, params: dict | None = None, headers: dict | None = None) -> dict:
         try:
-            response = self._http.get(path, params=params or None)
+            response = self._http.get(endpoint, params=params, headers=headers)
         except httpx.HTTPError as e:
             raise PlexError(f"Could not reach Plex at {self._http.base_url}: {e}") from e
         if response.status_code == 401:
             raise PlexError("Plex rejected the token (401). Check ASSAY_PLEX_TOKEN.")
         if response.is_error:
-            raise PlexError(f"GET {path} failed: HTTP {response.status_code}")
+            detail = response.text.strip()[:200]
+            raise PlexError(f"GET {endpoint} failed: HTTP {response.status_code}" + (f" ({detail})" if detail else ""))
         return response.json().get("MediaContainer", {})
 
     def sections(self) -> list[dict]:
@@ -70,8 +72,7 @@ class PlexClient:
         while True:
             container = self._get(
                 f"/library/sections/{section_key}/all",
-                type=item_type,
-                **{"X-Plex-Container-Start": start, "X-Plex-Container-Size": page_size},
+                {"type": item_type, "X-Plex-Container-Start": start, "X-Plex-Container-Size": page_size},
             )
             items = container.get("Metadata", [])
             yield from items
@@ -90,3 +91,17 @@ class PlexClient:
         if not items:
             raise PlexError(f"No metadata for ratingKey {rating_key}")
         return items[0]
+
+    def decision(
+        self,
+        rating_key: str,
+        identity: ClientIdentity,
+        *,
+        media_index: int = 0,
+        subtitles: str = "auto",
+        max_bitrate_kbps: int | None = None,
+    ) -> PlexDecision:
+        """What Plex would do if `identity` played this item now."""
+        params = decision_params(rating_key, media_index, subtitles=subtitles, max_bitrate_kbps=max_bitrate_kbps)
+        container = self._get("/video/:/transcode/universal/decision", params, identity.headers())
+        return parse_decision(container)

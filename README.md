@@ -47,6 +47,20 @@ assay clients map "Bedroom Roku" my-roku.toml
 
 Players are matched to profiles automatically using `match_platforms` and `match_products` in each profile, or explicitly with `assay clients map`.
 
+### Asking Plex directly
+
+`assay plex ask` and `assay plex verify` use Plex's transcode decision endpoint to ask what Plex *would* do for a client, without playing anything. They show Plex's own explanation (e.g. "Audio codec dca is not supported") next to Assay's prediction, and `verify` groups the disagreements into suggested profile fixes across the library.
+
+```sh
+assay plex ask "Blade Runner" -c lg-webos
+assay plex ask "Blade Runner" -c lg-webos --raw        # Plex's raw JSON, for debugging
+assay plex verify -c lg-webos --sample 200             # random sample of the library
+assay plex verify --as-player "Living Room TV"         # ask as a real player seen by watch
+assay plex verify -c lg-webos --subtitles none --max-bitrate 8000
+```
+
+Plex chooses the client's capabilities from the product and platform it's told, set by `[plex_identity]` in each profile, or taken from a real player with `--as-player`. Real apps can advertise extra capabilities during playback, so `plex watch` remains the ground truth; `verify` is the fast way to check a whole library.
+
 ## Client profiles
 
 Profiles in `src/assay/profiles/*.toml` describe what a client can direct play.
@@ -60,10 +74,10 @@ real Plex decisions**. Copy one and pass its path to `-c` to customise it, and u
 - `assay/diagnose/`: the rules engine (pure functions, no I/O)
 - `assay/store.py`, `assay/scan.py`: SQLite cache and incremental scan
 - `assay/watch.py`: session parsing, prediction for a specific playback, mismatch hints
+- `assay/plex/decision.py`, `assay/verify.py`: Plex decision endpoint and bulk comparison
 - `assay/cli.py`: Typer CLI
 
 ## Roadmap
 
-- Use Plex's transcode decision endpoint to validate profiles
 - ffprobe and deep-decode passes for corruption and details Plex doesn't expose
 - Remux-first fix queue (ffmpeg), tracking space saved

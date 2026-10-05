@@ -17,6 +17,13 @@ subtitles = ["srt", "webvtt", "mov_text"]
 hdr = ["hdr10", "hlg", "dolby_vision"]
 dovi_profiles = [5, 8]
 
+# Identity used when asking Plex for decisions. Best guess at what the LG app
+# sends; `assay plex verify --as-player "<TV name>"` uses the real values.
+[plex_identity]
+product = "Plex for LG"
+platform = "webOS"
+device = "LG TV"
+
 [video.h264]
 max_bit_depth = 8
 max_level = 51

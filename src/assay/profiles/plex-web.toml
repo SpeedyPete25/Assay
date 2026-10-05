@@ -13,6 +13,11 @@ subtitles = ["srt", "webvtt", "mov_text", "ass"]
 hdr = []
 dovi_profiles = []
 
+[plex_identity]
+product = "Plex Web"
+platform = "Chrome"
+device = "Windows"
+
 [video.h264]
 max_bit_depth = 8
 max_level = 52

@@ -12,6 +12,7 @@ from importlib import resources
 from pathlib import Path
 
 from assay.models import normalize_codec
+from assay.plex.decision import ClientIdentity
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,8 @@ class Profile:
     # Used by `assay plex watch` to pick a profile for a Plex player.
     match_platforms: frozenset[str] = frozenset()
     match_products: frozenset[str] = frozenset()
+    # Who to claim to be when asking Plex for a decision (`assay plex ask/verify`).
+    plex_identity: ClientIdentity | None = None
 
     def with_max_bitrate(self, kbps: int | None) -> Profile:
         return replace(self, max_bitrate_kbps=kbps) if kbps else self
@@ -63,6 +66,7 @@ def parse_profile(data: dict) -> Profile:
         max_bitrate_kbps=data.get("max_bitrate_kbps"),
         match_platforms=frozenset(data.get("match_platforms", [])),
         match_products=frozenset(data.get("match_products", [])),
+        plex_identity=ClientIdentity(**data["plex_identity"]) if "plex_identity" in data else None,
     )
 
 
