@@ -15,11 +15,16 @@ from rich.progress import Progress
 from rich.table import Table
 
 from assay.diagnose import Diagnosis, diagnose
+from assay.ffmpeg import ToolNotFound, find_tool
+from assay.filescan import deep_scan, file_jobs, probe_files
+from assay.diagnose.rules import check_health
+from assay.health import augment, file_findings
 from assay.models import Impact
 from assay.plex import PlexClient, PlexError
 from assay.plex.decision import ClientIdentity
 from assay.profiles import Profile, bundled_profiles, load_profile
 from assay.scan import scan_library, scannable_sections
+from assay.paths import common_roots, to_local
 from assay.store import Store
 from assay.verify import Check, check_version, verify
 from assay.watch import Player, Result, match_profile, poll_once
@@ -29,6 +34,8 @@ plex_app = typer.Typer(help="Talk to your Plex Media Server.", no_args_is_help=T
 app.add_typer(plex_app, name="plex")
 clients_app = typer.Typer(help="Client profiles and which Plex players use them.")
 app.add_typer(clients_app, name="clients")
+paths_app = typer.Typer(help="Map Plex's file paths to paths this machine can read.")
+app.add_typer(paths_app, name="paths")
 
 console = Console()
 
@@ -160,12 +167,12 @@ def clients_unmap(player: str, db: DbOption = Path("assay.db")) -> None:
 
 def _print_diagnosis(d: Diagnosis) -> None:
     v = d.version
-    header = f"[bold]{d.item.title}[/]"
+    header = f"[bold]{escape(d.item.title)}[/]"
     if len(d.item.versions) > 1:
         header += f"  [dim](version {v.id})[/]"
     console.print(header)
     for f in v.files:
-        console.print(f"  [dim]{f}[/]")
+        console.print(f"  [dim]{escape(f)}[/]")
 
     verdict = f"  On [bold]{d.profile.name}[/]: {_impact(d.impact)}"
     if d.worst_case != d.impact:
@@ -176,11 +183,12 @@ def _print_diagnosis(d: Diagnosis) -> None:
         console.print("  [green]No problems found.[/]")
     for f in d.findings:
         tag = _impact(f.impact) if f.impact is not None else "[magenta]Health[/]" if f.category == "health" else "[cyan]Note[/]"
-        console.print(f"  - {tag} {f.message}")
+        # Messages can quote ffmpeg output like "[h264 @ 0x1]", which Rich would treat as markup.
+        console.print(f"  - {tag} {escape(f.message)}")
         if f.condition:
-            console.print(f"      [dim]Applies {f.condition}.[/]")
+            console.print(f"      [dim]Applies {escape(f.condition)}.[/]")
         if f.fix:
-            console.print(f"      [dim]Fix:[/] {f.fix}")
+            console.print(f"      [dim]Fix:[/] {escape(f.fix)}")
     console.print()
 
 
@@ -194,14 +202,12 @@ def check(
     """Explain how one title will play on a client, and why."""
     profile = _profile(client, max_bitrate)
     with Store(db) as store:
-        item = store.get(query)
-        items = [item] if item else store.search(query)
-    if not items:
-        _fail(f"Nothing in the cache matches '{query}'. Run 'assay plex scan' first.")
-    if len(items) > 5:
-        console.print(f"[yellow]{len(items)} matches; showing the first 5. Narrow the search or use a ratingKey.[/]\n")
-    for item in items[:5]:
-        for d in diagnose(item, profile):
+        items = _find_items(store, query)
+        files = [f for item in items for v in item.versions for f in v.files]
+        probes, decodes = store.probes(files), store.decodes()
+    for item in items:
+        item, extra = augment(item, probes, decodes)
+        for d in diagnose(item, profile, extra):
             _print_diagnosis(d)
 
 
@@ -220,8 +226,10 @@ def report(
     total = 0
 
     with Store(db) as store:
+        probes, decodes = store.probes(), store.decodes()
         for item in store.items(library):
-            for d in diagnose(item, profile):
+            item, extra = augment(item, probes, decodes)
+            for d in diagnose(item, profile, extra):
                 total += 1
                 verdicts[d.impact] += 1
                 worst[d.worst_case] += 1
@@ -243,7 +251,7 @@ def report(
         effect = _impact(finding.impact) if finding.impact is not None else "Health" if finding.category == "health" else "Note"
         if finding.condition:
             effect += " [dim](conditional)[/]"
-        causes.add_row(str(len(hits)), effect, code, example.item.title)
+        causes.add_row(str(len(hits)), effect, code, escape(example.item.title))
     console.print(causes)
     console.print("[dim]Use 'assay check <title> -c <client>' for details and fixes.[/]")
 
@@ -510,6 +518,212 @@ def plex_verify(
     if errors:
         console.print(f"[yellow]{len(errors)} requests failed, e.g. {escape(errors[0].item.title)}: {escape(errors[0].error)}[/]")
     console.print("[dim]Plex answers from its server-side profile for this identity; the real app may support more.[/]")
+
+
+# --- step 2: files on disk ------------------------------------------------
+
+
+@paths_app.callback(invoke_without_command=True)
+def paths(ctx: typer.Context, db: DbOption = Path("assay.db")) -> None:
+    """Show path mappings and where Plex's files live."""
+    if ctx.invoked_subcommand:
+        return
+    with Store(db) as store:
+        mappings = store.path_mappings()
+        files = [f for item in store.items() for v in item.versions for f in v.files]
+
+    if mappings:
+        table = Table("Plex path", "Local path", title="Path mappings")
+        for plex_prefix, local_prefix in sorted(mappings.items()):
+            table.add_row(escape(plex_prefix), escape(local_prefix))
+        console.print(table)
+    else:
+        console.print("No path mappings: Plex's paths are used as-is (right when running on the server).\n")
+
+    if files:
+        roots = Table("Plex folder", "Files", "Reads from", title="Where Plex's files live")
+        for root, count in common_roots(files)[:15]:
+            roots.add_row(escape(root), str(count), escape(to_local(root, mappings)))
+        console.print(roots)
+    console.print("[dim]Add one with: assay paths add /media \\\\NAS\\media   then check with: assay paths test[/]")
+
+
+@paths_app.command("add")
+def paths_add(
+    plex_prefix: Annotated[str, typer.Argument(help="Path prefix as Plex reports it, e.g. /media")],
+    local_prefix: Annotated[str, typer.Argument(help=r"Same folder from this machine, e.g. \\NAS\media")],
+    db: DbOption = Path("assay.db"),
+) -> None:
+    """Map a Plex path prefix to a local one."""
+    with Store(db) as store:
+        store.add_path_mapping(plex_prefix, local_prefix)
+    console.print(f"{escape(plex_prefix)} -> {escape(local_prefix)}")
+    if not Path(local_prefix).exists():
+        console.print(f"[yellow]Note: {escape(local_prefix)} isn't reachable from here right now.[/]")
+
+
+@paths_app.command("remove")
+def paths_remove(plex_prefix: str, db: DbOption = Path("assay.db")) -> None:
+    """Remove a path mapping."""
+    with Store(db) as store:
+        removed = store.remove_path_mapping(plex_prefix)
+    console.print(f"Removed {escape(plex_prefix)}." if removed else f"No mapping for {escape(plex_prefix)}.")
+
+
+@paths_app.command("test")
+def paths_test(
+    db: DbOption = Path("assay.db"),
+    sample: Annotated[int, typer.Option("--sample", "-n", help="How many random files to check.")] = 20,
+) -> None:
+    """Check that a sample of Plex's files can be found from this machine."""
+    with Store(db) as store:
+        jobs = file_jobs(store)
+    if not jobs:
+        _fail("The cache is empty. Run 'assay plex scan' first.")
+    picked = random.sample(jobs, min(sample, len(jobs)))
+    missing = [j for j in picked if not Path(j.local_path).exists()]
+    console.print(f"{len(picked) - len(missing)}/{len(picked)} sampled files found.")
+    for job in missing[:5]:
+        console.print(f"  [red]missing[/] {escape(job.file)}\n          [dim]looked for {escape(job.local_path)}[/]")
+    if missing:
+        console.print("[dim]Fix with 'assay paths add <plex prefix> <local prefix>'; 'assay paths' shows the folders.[/]")
+
+
+FfprobeOption = Annotated[str | None, typer.Option("--ffprobe", help="Path to ffprobe (default: ASSAY_FFPROBE or PATH).")]
+FfmpegOption = Annotated[str | None, typer.Option("--ffmpeg", help="Path to ffmpeg (default: ASSAY_FFMPEG or PATH).")]
+
+
+def _tool(name: str, override: str | None) -> str:
+    try:
+        return find_tool(name, override)
+    except ToolNotFound as e:
+        _fail(str(e))
+
+
+@app.command("probe")
+def probe(
+    db: DbOption = Path("assay.db"),
+    library: Annotated[str | None, typer.Option("--library", "-l")] = None,
+    workers: Annotated[int, typer.Option(help="Files probed at once.")] = 4,
+    force: Annotated[bool, typer.Option("--force", help="Re-probe files that haven't changed.")] = False,
+    ffprobe_path: FfprobeOption = None,
+) -> None:
+    """Run ffprobe on every file: unreadable files, changes since Plex's scan, missing details."""
+    binary = _tool("ffprobe", ffprobe_path)
+    with Store(db) as store:
+        jobs = file_jobs(store, library)
+        if not jobs:
+            _fail("The cache is empty. Run 'assay plex scan' first.")
+        with Progress(console=console, transient=True) as progress:
+            task = progress.add_task("Probing", total=None)
+            summary = probe_files(
+                store,
+                jobs,
+                binary=binary,
+                workers=workers,
+                force=force,
+                on_progress=lambda done, total: progress.update(task, completed=done, total=total),
+            )
+    console.print(
+        f"Probed {summary.checked}, unchanged {summary.skipped}, missing {summary.missing}, "
+        f"with problems {len(summary.problems)}."
+    )
+    if summary.missing == len(jobs):
+        console.print("[yellow]No files were found. Set up path mappings: 'assay paths'.[/]")
+    console.print("[dim]See 'assay health' for details.[/]")
+
+
+@app.command("deepscan")
+def deepscan(
+    query: Annotated[str | None, typer.Argument(help="Only scan titles matching this.")] = None,
+    db: DbOption = Path("assay.db"),
+    library: Annotated[str | None, typer.Option("--library", "-l")] = None,
+    full: Annotated[bool, typer.Option("--full", help="Decode every frame (much slower, catches corrupt frames).")] = False,
+    limit: Annotated[int | None, typer.Option(help="Stop after this many files (run again to continue).")] = None,
+    workers: Annotated[int, typer.Option(help="Files scanned at once.")] = 1,
+    force: Annotated[bool, typer.Option("--force", help="Rescan files that haven't changed.")] = False,
+    ffmpeg_path: FfmpegOption = None,
+) -> None:
+    """Read whole files with ffmpeg to find corruption. Resumable: unchanged files are skipped."""
+    binary = _tool("ffmpeg", ffmpeg_path)
+
+    def report_file(job, record) -> None:
+        if record.error_count:
+            console.print(f"[red]{record.error_count} error(s)[/] {escape(job.title)} [dim]{escape(job.file)}[/]")
+            console.print(f"  [dim]{escape(record.errors[0]) if record.errors else ''}[/]")
+
+    with Store(db) as store:
+        jobs = file_jobs(store, library, query)
+        if not jobs:
+            _fail("No matching files in the cache.")
+        mode = "full decode" if full else "quick (read every packet)"
+        console.print(f"Deep scan, {mode}. Ctrl+C stops after the files in progress.\n")
+        try:
+            with Progress(console=console, transient=True) as progress:
+                task = progress.add_task("Scanning", total=None)
+                summary = deep_scan(
+                    store,
+                    jobs,
+                    binary=binary,
+                    full=full,
+                    workers=workers,
+                    force=force,
+                    limit=limit,
+                    on_result=report_file,
+                    on_progress=lambda d, total: progress.update(task, completed=d, total=total),
+                )
+        except KeyboardInterrupt:
+            console.print("Stopped. Run the same command again to continue.")
+            raise typer.Exit(130)
+    console.print(
+        f"\nScanned {summary.checked}, unchanged {summary.skipped}, missing {summary.missing}, "
+        f"with errors {len(summary.problems)}."
+    )
+
+
+@app.command("health")
+def health(
+    db: DbOption = Path("assay.db"),
+    library: Annotated[str | None, typer.Option("--library", "-l")] = None,
+) -> None:
+    """Library-wide file health: Plex's metadata, ffprobe and deep scan results."""
+    by_code: dict[str, list] = defaultdict(list)  # code -> [(Finding, title, version)]
+    files = probed = missing = scanned = 0
+    with Store(db) as store:
+        probes, decodes = store.probes(), store.decodes()
+        for item in store.items(library):
+            for version in item.versions:
+                files += len(version.files)
+                probed += sum(f in probes and not probes[f].missing for f in version.files)
+                missing += sum(f in probes and probes[f].missing for f in version.files)
+                scanned += sum(f in decodes for f in version.files)
+                findings = [*check_health(version, None), *file_findings(version, probes, decodes)]
+                for finding in findings:
+                    by_code[finding.code].append((finding, item.title, version))
+    if not files:
+        _fail("The cache is empty. Run 'assay plex scan' first.")
+
+    console.print(f"[bold]{files} files[/]: {probed} probed, {missing} not found, {scanned} deep-scanned.\n")
+    if not by_code:
+        console.print("[green]No problems found.[/]")
+    else:
+        summary = Table("Files", "Problem", "Example", title="Problems, most common first")
+        for code, hits in sorted(by_code.items(), key=lambda kv: -len(kv[1])):
+            summary.add_row(str(len(hits)), code, escape(hits[0][1]))
+        console.print(summary)
+
+        serious = [h for code in ("health.unreadable", "health.missing_file") for h in by_code.get(code, [])]
+        serious += [h for code, hits in by_code.items() if code.startswith("health.decode_errors") for h in hits]
+        if serious:
+            table = Table("Title", "Problem", "Fix", title=f"Needs attention (first 20 of {len(serious)})")
+            for finding, title, _ in serious[:20]:
+                table.add_row(escape(title), escape(finding.message), escape(finding.fix or ""))
+            console.print(table)
+
+    if probed + missing < files:
+        console.print("[dim]Run 'assay probe' to check the files themselves.[/]")
+    elif scanned < probed:
+        console.print("[dim]Run 'assay deepscan' (resumable) to look for corruption inside the files.[/]")
 
 
 if __name__ == "__main__":

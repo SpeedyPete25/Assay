@@ -61,6 +61,31 @@ assay plex verify -c lg-webos --subtitles none --max-bitrate 8000
 
 Plex chooses the client's capabilities from the product and platform it's told, set by `[plex_identity]` in each profile, or taken from a real player with `--as-player`. Real apps can advertise extra capabilities during playback, so `plex watch` remains the ground truth; `verify` is the fast way to check a whole library.
 
+## File health
+
+These commands read the media files themselves, so they need [ffmpeg](https://ffmpeg.org/) (`winget install Gyan.FFmpeg` on Windows; or set `ASSAY_FFPROBE` / `ASSAY_FFMPEG`) and access to the files, either on the Plex server itself or over a network share.
+
+Plex reports paths as the server sees them. If Assay runs on another machine, map them:
+
+```sh
+assay paths                                  # where Plex's files live, and current mappings
+assay paths add /media \\NAS\media            # Plex path prefix -> path from this machine
+assay paths test                             # check a sample of files can be found
+```
+
+Then:
+
+```sh
+assay probe                                  # ffprobe every file (incremental)
+assay deepscan --limit 50                    # read every packet of 50 more files (resumable)
+assay deepscan "Blade Runner" --full         # decode every frame of one title
+assay health                                 # library-wide problems, worst first
+```
+
+- `probe` finds files that are missing, unreadable, changed since Plex analysed them, or shorter than Plex thinks (usually truncated). It also fills in details Plex sometimes lacks, such as bit depth and Dolby Vision profile, which `check` and `report` then use.
+- `deepscan` quick mode reads and parses every packet, which catches truncation and container damage at disk or network speed. `--full` decodes every frame and also catches corrupt video, but is roughly real-time for 4K on a CPU. Both skip files that haven't changed since their last scan, so they can be run in batches.
+- `check` and `report` include any health problems found.
+
 ## Client profiles
 
 Profiles in `src/assay/profiles/*.toml` describe what a client can direct play.
@@ -75,9 +100,10 @@ real Plex decisions**. Copy one and pass its path to `-c` to customise it, and u
 - `assay/store.py`, `assay/scan.py`: SQLite cache and incremental scan
 - `assay/watch.py`: session parsing, prediction for a specific playback, mismatch hints
 - `assay/plex/decision.py`, `assay/verify.py`: Plex decision endpoint and bulk comparison
+- `assay/paths.py`: Plex-to-local path mapping
+- `assay/ffmpeg.py`, `assay/filescan.py`, `assay/health.py`: ffprobe/ffmpeg wrappers, incremental file scans, health findings
 - `assay/cli.py`: Typer CLI
 
 ## Roadmap
 
-- ffprobe and deep-decode passes for corruption and details Plex doesn't expose
 - Remux-first fix queue (ffmpeg), tracking space saved

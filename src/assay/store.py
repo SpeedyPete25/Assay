@@ -13,6 +13,7 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
+from assay.health import DecodeRecord, ProbeRecord
 from assay.models import Impact, MediaItem
 from assay.plex.parse import display_title, parse_metadata
 
@@ -53,6 +54,37 @@ CREATE TABLE IF NOT EXISTS playbacks (
 CREATE TABLE IF NOT EXISTS client_map (
     player_title  TEXT PRIMARY KEY COLLATE NOCASE,
     profile       TEXT NOT NULL
+);
+
+-- Plex path prefix -> local path prefix, for reading files from this machine.
+CREATE TABLE IF NOT EXISTS path_map (
+    plex_prefix   TEXT PRIMARY KEY,
+    local_prefix  TEXT NOT NULL
+);
+
+-- ffprobe results, keyed by the path Plex reports. size/mtime detect changes.
+CREATE TABLE IF NOT EXISTS probes (
+    file        TEXT PRIMARY KEY,
+    local_path  TEXT NOT NULL,
+    size        INTEGER,
+    mtime       INTEGER,
+    probed_at   INTEGER NOT NULL,
+    ok          INTEGER NOT NULL,
+    missing     INTEGER NOT NULL,
+    error       TEXT,
+    result      TEXT
+);
+
+-- Deep scans (ffmpeg reading/decoding the whole file).
+CREATE TABLE IF NOT EXISTS decodes (
+    file         TEXT PRIMARY KEY,
+    size         INTEGER,
+    mtime        INTEGER,
+    mode         TEXT NOT NULL,
+    scanned_at   INTEGER NOT NULL,
+    seconds      REAL NOT NULL,
+    error_count  INTEGER NOT NULL,
+    errors       TEXT NOT NULL
 );
 """
 
@@ -212,3 +244,74 @@ class Store:
         cursor = self._db.execute("DELETE FROM client_map WHERE player_title = ?", (player_title,))
         self._db.commit()
         return cursor.rowcount == 1
+
+    # --- path mappings ---------------------------------------------------
+
+    def path_mappings(self) -> dict[str, str]:
+        return dict(self._db.execute("SELECT plex_prefix, local_prefix FROM path_map"))
+
+    def add_path_mapping(self, plex_prefix: str, local_prefix: str) -> None:
+        self._db.execute("INSERT OR REPLACE INTO path_map VALUES (?, ?)", (plex_prefix, local_prefix))
+        self._db.commit()
+
+    def remove_path_mapping(self, plex_prefix: str) -> bool:
+        cursor = self._db.execute("DELETE FROM path_map WHERE plex_prefix = ?", (plex_prefix,))
+        self._db.commit()
+        return cursor.rowcount == 1
+
+    # --- probes and deep scans -------------------------------------------
+
+    def save_probe(self, record: ProbeRecord) -> None:
+        self._db.execute(
+            "INSERT OR REPLACE INTO probes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                record.file,
+                record.local_path,
+                record.size,
+                record.mtime,
+                int(time.time()),
+                int(record.ok),
+                int(record.missing),
+                record.error,
+                json.dumps(record.data) if record.data is not None else None,
+            ),
+        )
+        self._db.commit()
+
+    def probes(self, files: Iterable[str] | None = None) -> dict[str, ProbeRecord]:
+        """Probe records, for all files or just the given ones."""
+        query = "SELECT file, local_path, size, mtime, ok, missing, error, result FROM probes"
+        if files is None:
+            rows = list(self._db.execute(query))
+        else:
+            files, rows = list(files), []
+            for i in range(0, len(files), 500):  # stay under SQLite's parameter limit
+                chunk = files[i : i + 500]
+                rows += self._db.execute(f"{query} WHERE file IN ({','.join('?' * len(chunk))})", chunk)
+        return {
+            file: ProbeRecord(file, local, size, mtime, bool(ok), bool(missing), error, json.loads(result) if result else None)
+            for file, local, size, mtime, ok, missing, error, result in rows
+        }
+
+    def save_decode(self, record: DecodeRecord) -> None:
+        self._db.execute(
+            "INSERT OR REPLACE INTO decodes VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                record.file,
+                record.size,
+                record.mtime,
+                record.mode,
+                int(time.time()),
+                record.seconds,
+                record.error_count,
+                json.dumps(record.errors),
+            ),
+        )
+        self._db.commit()
+
+    def decodes(self) -> dict[str, DecodeRecord]:
+        rows = self._db.execute("SELECT file, size, mtime, mode, seconds, error_count, errors FROM decodes")
+        return {
+            file: DecodeRecord(file, size, mtime, mode, seconds, error_count, json.loads(errors))
+            for file, size, mtime, mode, seconds, error_count, errors in rows
+        }

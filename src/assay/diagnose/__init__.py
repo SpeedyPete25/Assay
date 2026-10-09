@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from assay.diagnose.rules import RULES
@@ -34,14 +35,20 @@ class Diagnosis:
         return tuple(f for f in self.findings if f.category == "health")
 
 
-def diagnose_version(item: MediaItem, version: MediaVersion, profile: Profile) -> Diagnosis:
-    findings = tuple(f for rule in RULES for f in rule(version, profile))
+def diagnose_version(
+    item: MediaItem, version: MediaVersion, profile: Profile, extra: Iterable[Finding] = ()
+) -> Diagnosis:
+    """Run every rule. `extra` adds findings from outside the rules (e.g. file health)."""
+    findings = tuple(f for rule in RULES for f in rule(version, profile)) + tuple(extra)
     return Diagnosis(item, version, profile, findings)
 
 
-def diagnose(item: MediaItem, profile: Profile) -> list[Diagnosis]:
-    """Diagnose every version of an item."""
-    return [diagnose_version(item, v, profile) for v in item.versions]
+def diagnose(
+    item: MediaItem, profile: Profile, extra: dict[int, list[Finding]] | None = None
+) -> list[Diagnosis]:
+    """Diagnose every version of an item. `extra` maps version id to additional findings."""
+    extra = extra or {}
+    return [diagnose_version(item, v, profile, extra.get(v.id, ())) for v in item.versions]
 
 
 __all__ = ["Diagnosis", "diagnose", "diagnose_version"]
